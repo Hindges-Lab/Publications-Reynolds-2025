@@ -1,0 +1,107 @@
+import scipy
+import scipy.io
+import numpy as np
+import os
+import glob
+
+
+file_path = '/Volumes/Reynolds/Ch4-parameters/Ch4_longitudinal/7dpf/Analysis/OSV'
+
+def read_files():
+    control_list = []
+    for filename in glob.glob(os.path.join(file_path, 'Control', 'exp*.mat')):
+        z1 = scipy.io.loadmat(filename)
+        a = z1['DEFAULTS_POST_GROUP']['fitted_osi_angle'][0][0].flatten()
+        control_list += list(np.mod(a, np.pi))
+
+    vertical_list = []
+    for filename in glob.glob(os.path.join(file_path, 'Vertical', 'exp*.mat')):
+        z1 = scipy.io.loadmat(filename)
+        a = z1['DEFAULTS_POST_GROUP']['fitted_osi_angle'][0][0].flatten()
+        vertical_list += list(np.mod(a, np.pi))
+
+    horizonal_list = []
+    for filename in glob.glob(os.path.join(file_path, 'Horizontal', 'exp*.mat')):
+        z1 = scipy.io.loadmat(filename)
+        a = z1['DEFAULTS_POST_GROUP']['fitted_osi_angle'][0][0].flatten()
+        horizonal_list += list(np.mod(a, np.pi))
+
+    return control_list, vertical_list, horizonal_list
+
+
+def watson_u2_test(sample1, sample2):
+    x = np.sort(np.array(sample1))
+    y = np.sort(np.array(sample2))
+
+    n = len(x)
+    m = len(y)
+    N = n + m
+
+    combined = np.concatenate([x, y])
+    labels = np.array([0] * n + [1] * m)
+    sorted_indices = np.argsort(combined)
+    labels_sorted = labels[sorted_indices]
+
+    F_n = np.cumsum(labels_sorted == 0) / n
+    G_m = np.cumsum(labels_sorted == 1) / m
+    D = F_n - G_m
+    U2 = np.sum((D - np.mean(D)) ** 2) * (n * m) / (N ** 2)
+    return U2
+
+
+def watson_u2_bootstrap(sample1, sample2, bootstrap_samples=10000, jitter=False, jitter_size=1e-10, seed=None):
+    #executes watson U2 test with optional jittering and bootstrapped p-value (currently no jittering to get a true value)
+
+    rng = np.random.default_rng(seed)
+
+    if jitter:
+        sample1 = sample1 + rng.uniform(-jitter_size, jitter_size, size=len(sample1))
+        sample2 = sample2 + rng.uniform(-jitter_size, jitter_size, size=len(sample2))
+
+    observed_stat = watson_u2_test(sample1, sample2)
+
+    combined = np.concatenate([sample1, sample2])
+    n = len(sample1)
+
+    resampled_stats = []
+    for _ in range(bootstrap_samples):
+        rng.shuffle(combined)
+        new1 = combined[:n]
+        new2 = combined[n:]
+        stat = watson_u2_test(new1, new2)
+        resampled_stats.append(stat)
+
+    p_value = np.mean(np.array(resampled_stats) >= observed_stat)
+
+    return observed_stat, p_value
+
+
+control_list, vertical_list, horizonal_list = read_files()
+
+#watson U2 test
+cvv = scipy.stats.anderson_ksamp([control_list, vertical_list],
+                                          method=scipy.stats.PermutationMethod(n_resamples=10000))
+print("Control vs Vertical")
+print(f"Anderson statistic: {cvv.statistic}")
+print(f"Anderson p-value: {cvv.pvalue}")
+print("Watson U**2 stat and p-value:", watson_u2_bootstrap(np.array(control_list), np.array(vertical_list)))
+
+cvh = scipy.stats.anderson_ksamp([control_list, horizonal_list],
+                                          method=scipy.stats.PermutationMethod(n_resamples=10000))
+print("Control vs Horizontal")
+print(f"Anderson statistic: {cvh.statistic}")
+print(f"Anderson p-value: {cvh.pvalue}")
+print("Watson U**2 stat and p-value:", watson_u2_bootstrap(np.array(control_list), np.array(horizonal_list)))
+
+vvh = scipy.stats.anderson_ksamp([vertical_list, horizonal_list],
+                                          method=scipy.stats.PermutationMethod(n_resamples=10000))
+print("Vertical vs Horizontal")
+print(f"Anderson statistic: {vvh.statistic}")
+print(f"Anderson p-value: {vvh.pvalue}")
+print("Watson U**2 stat and p-value:", watson_u2_bootstrap(np.array(vertical_list), np.array(horizonal_list)))
+
+all_together = scipy.stats.anderson_ksamp([control_list, vertical_list, horizonal_list],
+                                          method=scipy.stats.PermutationMethod(n_resamples=10000))
+print("All together")
+print(f"Statistic: {all_together.statistic}")
+print(f"p-value: {all_together.pvalue}")
