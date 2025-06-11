@@ -1,0 +1,202 @@
+import os
+import glob
+import numpy as np
+import scipy.io
+import pandas as pd
+import seaborn as sns
+import itertools
+from itertools import combinations
+import matplotlib.pyplot as plt
+from scipy.stats import f_oneway, kruskal
+
+# 1. Load angles and histograms to compute the OSV
+def load_angles_from_folder(folder, angle_key='fitted_osi_angle'):
+    files = glob.glob(os.path.join(folder, '*.mat'))
+    angles = []
+    for fn in files:
+        m = scipy.io.loadmat(fn, squeeze_me=True, struct_as_record=False)
+        s = m['DEFAULTS_POST_GROUP']
+        if hasattr(s, 'fitted_osi_angle'):
+            a = getattr(s, angle_key).flatten()
+        else:
+            a = s[0][0].fitted_osi_angle.flatten()
+        angles.append(np.mod(a, np.pi))
+    return angles
+
+def compute_osv(a, bins, x):
+    y, _ = np.histogram(a, bins=bins)
+    V = np.sum(y * np.exp(2j * x)) / np.sum(y)
+    thp = np.mod(np.angle(V), np.pi)
+    osi = np.abs(V)
+    return thp, osi
+
+
+
+# 2. Shuffling
+def shuffle_null(a_len, bins, x, n_shuffle=1000):
+    osi_sh = np.zeros(n_shuffle)
+    for i in range(n_shuffle):
+        a_sh = np.random.rand(a_len) * np.pi
+        y_sh, _ = np.histogram(a_sh, bins=bins)
+        V = np.sum(y_sh * np.exp(2j * x)) / np.sum(y_sh)
+        osi_sh[i] = np.abs(V)
+    return osi_sh
+
+#3. subset shuffling of 5 random larvae at a time.
+def sample_group(angles_list, subset_size=5, n_samples=500, bins=None, x=None, n_shuffle=1000):
+    results = []
+    if bins is None:
+        bins = np.linspace(0, np.pi, 51)
+    if x is None:
+        x = bins[:-1] + (bins[1] - bins[0]) / 2
+
+    for samp in range(n_samples):
+        chosen = np.random.choice(len(angles_list), subset_size, replace=False)
+        pooled = np.concatenate([angles_list[i] for i in chosen])
+        θp, osi = compute_osv(pooled, bins, x)
+        null_osi = shuffle_null(len(pooled), bins, x, n_shuffle=n_shuffle)
+        z = (osi - null_osi.mean()) / null_osi.std()
+        results.append({
+            'sample_id': samp,
+            'theta_pref_deg': θp * 180 / np.pi,
+            'osi': osi,
+            'z_score': z
+        })
+    return pd.DataFrame(results)
+
+#4. Now I am running with my data
+if __name__ == '__main__':
+    env_paths = {
+        'Control': 'control path',
+        'Vertical': 'vertical path',
+        'Horizontal': 'horizontal path',
+    }
+    subset_size = 5
+    n_samples = 10000
+    n_shuffle = 500
+    #this bit above overwrites the sample_group function
+
+
+    results_dir = 'results path'
+    os.makedirs(results_dir, exist_ok=True)
+
+    bins = np.linspace(0, np.pi, 51)
+    x = bins[:-1] + np.diff(bins[:2]) / 2
+
+    all_dfs = []
+    for env, folder in env_paths.items():
+        print(f'Loading angles for {env}...')
+        angles = load_angles_from_folder(folder)
+        print(f'  {len(angles)} larvae found.')
+        print(f'Sampling subsets and computing z-scores for {env}...')
+        df = sample_group(angles, subset_size, n_samples, bins, x, n_shuffle)
+        df['environment'] = env
+        all_dfs.append(df)
+
+    df_all = pd.concat(all_dfs, ignore_index=True)
+
+    out_csv = os.path.join(results_dir, 'subset_shuffle_results.csv')
+    df_all.to_csv(out_csv, index=False)
+    print(f'All results saved to {out_csv}')
+
+    #5. compute descriptive statistics for each environment, print below, and save to a CSV file
+    stats_summary = df_all.groupby('environment')['z_score'].agg(
+        count='count',
+        mean='mean',
+        std='std',
+        q1=lambda x: x.quantile(0.25),
+        median='median',
+        q3=lambda x: x.quantile(0.75)
+    ).reset_index()
+    print("\nDescriptive Statistics by Environment:")
+    print(stats_summary.to_string(index=False, float_format="%.3f"))
+    stats_summary_csv = os.path.join(results_dir, 'zscore_descriptive_stats.csv')
+    stats_summary.to_csv(stats_summary_csv, index=False)
+    print(f'Descriptive statistics saved to {stats_summary_csv}')
+
+
+
+
+
+    #6. plots for z scores
+    custom_colors = ['gold', 'dodgerblue', 'deeppink']
+    plt.figure(figsize=(8, 5))
+    sns.violinplot(x='environment', y='z_score', data=df_all, inner='quartile', palette=custom_colors)
+    # plt.title('Distribution of Shuffle‐based Z-scores by Environment')
+    plt.ylabel(ylabel='OSI Z-score', fontsize=14)
+    plt.xlabel('')
+    ax = plt.gca()
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.set_yticks([-50, 0, 50, 100, 150, 200, 250, 300])
+    ax.tick_params(axis='both', labelsize=14)
+    plt.tight_layout()
+    plt.savefig(os.path.join(results_dir, 'zscore_violin_by_env.png'), dpi=300)
+    plt.savefig(os.path.join(results_dir, 'zscore_violin_by_env.svg'), dpi=300)
+    plt.show()
+
+
+    #7. stats - ANOVA, kruskal-wallis and cohens d test
+    groups = [df_all.query('environment==@env')['z_score'] for env in env_paths]
+    F, p_anova = f_oneway(*groups)
+    H, p_kw    = kruskal(*groups)
+    grand_mean = df_all.z_score.mean()
+    ssb = sum(len(g)*(g.mean()-grand_mean)**2 for g in groups)
+    sst = sum((df_all.z_score-grand_mean)**2)
+    eta2 = ssb/sst
+    print(f'ANOVA: F={F:.3f}, p={p_anova:.3g}, η²={eta2:.3f}')
+    print(f'Kruskal–Wallis: H={H:.3f}, p={p_kw:.3g}')
+
+    def cohens_d(a, b):
+        n1, n2 = len(a), len(b)
+        s1, s2 = a.std(ddof=1), b.std(ddof=1)
+        sd = np.sqrt(((n1 - 1) * s1 ** 2 + (n2 - 1) * s2 ** 2) / (n1 + n2 - 2))
+        return (a.mean() - b.mean()) / sd
+
+    for i, e1 in enumerate(env_paths):
+        for j, e2 in enumerate(env_paths):
+            if j > i:
+                d = cohens_d(groups[i], groups[j])
+                print(f"Cohen's d {e1} vs {e2}: {d:.2f}")
+
+#8. save stats
+stats_out = os.path.join(results_dir, 'statistical_results.txt')
+with open(stats_out, 'w') as f:
+    f.write(f"ANOVA: F={F:.3f}, p={p_anova:.3g}, η²={eta2:.3f}\n")
+    f.write(f"Kruskal–Wallis: H={H:.3f}, p={p_kw:.3g}\n")
+    for i, e1 in enumerate(env_paths):
+        for j, e2 in enumerate(env_paths):
+            if j > i:
+                d = cohens_d(groups[i], groups[j])
+                f.write(f"Cohen's d {e1} vs {e2}: {d:.2f}\n")
+print(f'Statistical test results saved to {stats_out}')
+
+
+#9. Make a cohen's d figure
+cohen_d_values = []
+labels = []
+for (e1, e2) in itertools.combinations(env_paths, 2):
+    d = cohens_d(df_all.query('environment == @e1')['z_score'],
+                 df_all.query('environment == @e2')['z_score'])
+    cohen_d_values.append(d)
+    labels.append(f'{e1} vs {e2}')
+
+plt.figure(figsize=(8, 4))
+sns.barplot(x=cohen_d_values, y=labels, orient='h', color='lightgrey')
+plt.axvline(0.2, color='gray', linestyle='--')
+plt.axvline(0.5, color='gray', linestyle='--')
+plt.axvline(0.8, color='gray', linestyle='--')
+# plt.title("Cohen's d Effect Sizes Between Environments")
+plt.xlabel("Cohen's d")
+ax = plt.gca()
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(results_dir, 'cohens_d_comparisons.png'), dpi=300)
+plt.savefig(os.path.join(results_dir, 'cohens_d_comparisons.svg'), dpi=300)
+plt.close()
+
+
+#10. Done!
+print('Effect size plots saved to results folder.')
